@@ -1,0 +1,18 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/jihun/robot_ws/install/two_wheeled_robot/lib/python3.8/site-packages",
+        "/home/jihun/robot_ws/build/nav2_simple_commander",
+        "/home/jihun/robot_ws/install/nav2_simple_commander/lib/python3.8/site-packages",
+        "/home/jihun/robot_ws/install/nav2_gazebo_spawner/lib/python3.8/site-packages",
+        "/home/jihun/robot_ws/install/nav2_common/lib/python3.8/site-packages",
+        "/opt/ros/galactic/lib/python3.8/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/jihun/robot_ws/install/two_wheeled_robot/lib/python3.8/site-packages",
+        "/home/jihun/robot_ws/build/nav2_simple_commander",
+        "/home/jihun/robot_ws/install/nav2_simple_commander/lib/python3.8/site-packages",
+        "/home/jihun/robot_ws/install/nav2_gazebo_spawner/lib/python3.8/site-packages",
+        "/home/jihun/robot_ws/install/nav2_common/lib/python3.8/site-packages",
+        "/opt/ros/galactic/lib/python3.8/site-packages"
+    ]
+}
