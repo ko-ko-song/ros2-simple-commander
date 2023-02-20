@@ -13,41 +13,165 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np  # Scientific computing library for Python
+import math
+from rclpy.executors import MultiThreadedExecutor
 import time
 from geometry_msgs.msg import PoseStamped
 from nav2_simple_commander_custom.robot_navigator import BasicNavigator, TaskResult
 import rclpy
+from rclpy.node import Node
 from rclpy.duration import Duration
-
 
 import websocket
 import threading
 import json
 from nav_msgs.srv import GetMap
 
-
-def on_open(ws):
-    ws.send("Connected")
-    print("Opened connection")
-
-
-def on_message(ws, message):
-    print(message)
-    parsed = json.loads(message)
-    print(parsed['positionX'], parsed['positionY'], parsed['positionZ'], parsed['orientationX'], parsed['orientationY'],
-          parsed['orientationZ'], parsed['orientationW'])
-
-    goToPose(ws, parsed['positionX'], parsed['positionY'], parsed['positionZ'], parsed['orientationX'], parsed['orientationY'],
-             parsed['orientationZ'], parsed['orientationW'])
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from sensor_msgs.msg import LaserScan
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 
-def on_close(ws):
-    print("close")
+class WebMonitorInterface():
+    def __init__(self, subscriber, commander):
+        self.subscriber = subscriber
+        self.commander = commander
+        self.ws = None
+
+    def connect(self, uri):
+        websocket.enableTrace(False)
+        self.ws = websocket.WebSocketApp(
+            uri, on_message=self.on_message, on_close=self.on_close, on_open=self.on_open)
+        wst = threading.Thread(target=self.ws.run_forever)
+        print("ws : connecting " + uri)
+        wst.daemon = True
+        wst.start()
+        self.start()
+
+    def on_open(self, ws):
+        self.ws = ws
+        print("ws: Opened connection")
+
+    def on_message(self, ws, message):
+        parsed = json.loads(message)
+        # print("ws: received   " + parsed["type"])
+        messageType = parsed["type"]
+        if (messageType == "requestGoToPose"):
+            self.commander.requestGoToPose(parsed['positionX'], parsed['positionY'], parsed['positionZ'], parsed['orientationX'], parsed['orientationY'],
+                                           parsed['orientationZ'], parsed['orientationW'])
+        elif (messageType == "requestStaticMap"):
+            self.commander.requestStaticMap()
+
+    def on_close(self, ws):
+        print("ws: close")
+
+    def send_message(self, type, json_message):
+        # print("send message   type : " + type)
+        if (self.ws != None):
+            self.ws.send(json_message)
+
+    def start(self):
+        # print("start")
+        self.subscriber.set_interface(self)
+        self.commander.set_interface(self)
+        # print("start done")
 
 
-"""
-Basic navigation demo to go to pose.
-"""
+class SubscriberForWeb(Node):
+    def __init__(self):
+        super().__init__(node_name='subscriber_for_web')
+
+        self.laser_scan_pub = self.create_subscription(
+            LaserScan, "scan", self._laserScanCallback, QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.laser_scan_pub
+
+        self.localization_pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, 'amcl_pose', self._amclPoseCallback, 10)
+
+        self.interface = None
+
+    def _amclPoseCallback(self, message):
+        # self.info('Received amcl')
+        if (self.interface != None):
+            euler = self.euler_from_quaternion(message.pose.pose.orientation.x, message.pose.pose.orientation.y,
+                                               message.pose.pose.orientation.z, message.pose.pose.orientation.w)
+            angle = euler[2]
+            json_message = json.dumps(
+                dict(type="amcl", positionX=message.pose.pose.position.x, positionY=message.pose.pose.position.y, positionZ=message.pose.pose.position.z,
+                     angle=angle))
+
+            # print(json_message)
+            self.interface.send_message("amcl", json_message)
+        return
+
+    def _laserScanCallback(self, message):
+
+        ranges = []
+        if (self.interface != None):
+            range_max = message.range_max
+            for i in range(0, 360):
+                if (message.ranges[i] == float("inf")):
+                    ranges.append(range_max)
+                else:
+                    ranges.append(message.ranges[i])
+
+            json_message = json.dumps(
+                dict(type="laser_scan", angle_min=message.angle_min, angle_max=message.angle_max, angle_increment=message.angle_increment,
+                     time_increment=message.time_increment, scan_time=message.scan_time, range_min=message.range_min, range_max=message.range_max,
+                     ranges=ranges))
+            # print(json_message)
+            self.interface.send_message("laser_scan", json_message)
+        return
+
+    def get_quaternion_from_euler(self, roll, pitch, yaw):
+
+        qx = np.sin(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) - \
+            np.cos(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
+        qy = np.cos(roll/2) * np.sin(pitch/2) * np.cos(yaw/2) + \
+            np.sin(roll/2) * np.cos(pitch/2) * np.sin(yaw/2)
+        qz = np.cos(roll/2) * np.cos(pitch/2) * np.sin(yaw/2) - \
+            np.sin(roll/2) * np.sin(pitch/2) * np.cos(yaw/2)
+        qw = np.cos(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) + \
+            np.sin(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
+
+        return [qx, qy, qz, qw]
+
+    def euler_from_quaternion(self, x, y, z, w):
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        roll_x = math.atan2(t0, t1)
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        pitch_y = math.asin(t2)
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        yaw_z = math.atan2(t3, t4)
+
+        return roll_x, pitch_y, yaw_z  # in radians
+
+    def set_interface(self, interface):
+        self.interface = interface
+        return
+
+    def info(self, msg):
+        self.get_logger().info(msg)
+        return
+
+    def warn(self, msg):
+        self.get_logger().warn(msg)
+        return
+
+    def error(self, msg):
+        self.get_logger().error(msg)
+        return
+
+    def debug(self, msg):
+        self.get_logger().debug(msg)
+        return
 
 
 class SimpleCommander(BasicNavigator):
@@ -55,13 +179,17 @@ class SimpleCommander(BasicNavigator):
         super(SimpleCommander, self).__init__()
         self.get_staticmap_srv = self.create_client(
             GetMap, '/map_server/map')
+        self.interface = None
 
-    def requestGoToPose(self, ws, posX, posY, posZ, oriX, oriY, oriZ, oriW):
+    def set_interface(self, interface):
+        self.interface = interface
+        return
 
+    def requestGoToPose(self, posX, posY, posZ, oriX, oriY, oriZ, oriW):
         # Go to our demos first goal pose
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = 'map'
-        goal_pose.header.stamp = super.get_clock().now().to_msg()
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
         goal_pose.pose.position.x = float(posX)
         goal_pose.pose.position.y = float(posY)
         goal_pose.pose.orientation.x = float(oriX)
@@ -81,9 +209,23 @@ class SimpleCommander(BasicNavigator):
             i = i + 1
             feedback = self.getFeedback()
             if feedback and i % 5 == 0:
-                print('Estimated time of arrival: ' + '{0:.0f}'.format(
-                    Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9)
-                    + ' seconds.')
+                print('Estimated time of arrival: ' + '{0:.0f}'.format(Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9)
+                      + ' seconds.')
+                remainingTime = round(Duration.from_msg(
+                    feedback.estimated_time_remaining).nanoseconds / 1e9, 2)
+                # remainingTime = (
+                #     feedback.estimated_time_remaining).nanoseconds / 1e9
+
+                feedback_msg = 'Estimated time of arrival: ' + \
+                    str(remainingTime) + " seconds"
+                # print(feedback_msg)
+                json_message = json.dumps(
+                    dict(type="feedback", feedback=feedback_msg))
+                # print(json_message)
+                # print(self.interface.ws)
+                self.interface.send_message("feedback", json_message)
+
+                # print(json_message)
 
                 # Some navigation timeout to demo cancellation
                 if Duration.from_msg(feedback.navigation_time) > Duration(seconds=600.0):
@@ -96,32 +238,29 @@ class SimpleCommander(BasicNavigator):
 
         # Do something depending on the return code
         result = self.getResult()
+        json_message = json.dumps(dict())
         if result == TaskResult.SUCCEEDED:
             print('Goal succeeded!')
-            ws.send('Goal succeeded!')
-        elif result == TaskResult.CANCELED:
-            print('Goal was canceled!')
-            ws.send('Goal was canceled!')
-        elif result == TaskResult.FAILED:
-            print('Goal failed!')
-            ws.send('Goal failed!')
-        else:
-            print('Goal has an invalid return status!')
-            ws.send('Goal has an invalid return status!')
+            json_message = json.dumps(dict(type="result", result="success"))
 
-    def sendStaticMap(self, ws):
+        elif result == TaskResult.CANCELED:
+            json_message = json.dumps(dict(type="result", result="canceled"))
+
+        elif result == TaskResult.FAILED:
+            json_message = json.dumps(dict(type="result", result="failed"))
+
+        else:
+            json_message = json.dumps(
+                dict(type="result", result="invalid return state"))
+
+        self.interface.send_message("result", json_message)
+
+    def requestStaticMap(self):
         static_map = self.getStaticMap()
-        static_map_json = json.dumps(dict(type="static_map", width=static_map.info.width,
+        static_map_json = json.dumps(dict(type="static_map", resolution=static_map.info.resolution, width=static_map.info.width,
                                           height=static_map.info.height, positionX=static_map.info.origin.position.x,
                                           positionY=static_map.info.origin.position.y, data=static_map.data.tolist()))
-        # ws.send(static_map_json)
-        print(static_map_json)
-
-        # temp = json.loads(static_map_json)
-        # print(temp["type"])
-        # print(temp["data"])
-        # print(len(temp["data"]))
-        ##### add#####
+        self.interface.send_message("static_map", static_map_json)
 
     def getStaticMap(self):
         """Get the static map."""
@@ -135,121 +274,28 @@ class SimpleCommander(BasicNavigator):
 
 def main():
     rclpy.init()
-    simpleCommander = SimpleCommander()
-    simpleCommander.waitUntilNav2Active()
-    rclpy.spin(simpleCommander)
-    while rclpy.ok():
-        print("ok")
-        pass
+    try:
+        subscriber = SubscriberForWeb()
+        simpleCommander = SimpleCommander()
+        simpleCommander.waitUntilNav2Active()
+        executor = MultiThreadedExecutor(num_threads=3)
+        executor.add_node(simpleCommander)
+        executor.add_node(subscriber)
 
-    # run simple commander
-    # ws
-    # run wst
-    # run spin(subscribe pos)
+        web_monitor_interface = WebMonitorInterface(
+            subscriber, simpleCommander)
+        web_monitor_interface.connect("ws://192.168.1.22:36888")
+        try:
+            executor.spin()
+        except KeyboardInterrupt:
+            simpleCommander.get_logger().info('Keyboard Interrupt (SIGINT)')
+        finally:
+            executor.shutdown()
+            simpleCommander.destroy_node()
+            subscriber.destroy_node()
+    finally:
+        rclpy.shutdown()
 
-    # exit key interrupt
 
-    # simpleCommander.sendStaticMap(0)
-
-    # rclpy.spin(simpleCommander)
-    # Set our demo's initial pose
-    # initial_pose = PoseStamped()
-    # initial_pose.header.frame_id = 'map'
-    # initial_pose.header.stamp = navigator.get_clock().now().to_msg()
-    # initial_pose.pose.position.x = 3.45
-    # initial_pose.pose.position.y = 2.15
-    # initial_pose.pose.orientation.x = 0.707
-    # initial_pose.pose.orientation.w = -0.707
-    # navigator.setInitialPose(initial_pose)
-    # print('init_pose', initial_pose.pose)
-
-    # Activate navigation, if not autostarted. This should be called after setInitialPose()
-    # or this will initialize at the origin of the map and update the costmap with bogus readings.
-    # If autostart, you should `waitUntilNav2Active()` instead.
-    # navigator.lifecycleStartup()
-
-    # Wait for navigation to fully activate, since autostarting nav2
-    # navigator.waitUntilNav2Active()
-    # sendStaticMap(0)
-    # rclpy.spin
-    # static_map = navigator.getStaticMap()
-    # print("width : ", static_map.info.width)
-    # print("height : ", static_map.info.height)
-    # print("position : ", static_map.info.origin.position)
-    # static_map_json = json.dumps(dict(type="static_map", width=static_map.info.width,
-    #                                   height=static_map.info.height, positionX=static_map.info.origin.position.x,
-    #                                   positionY=static_map.info.origin.position.y, data=static_map.data))
-    # static_map_json = dict(type="static_map", width=static_map.info.width,
-    #                        height=static_map.info.height, positionX=static_map.info.origin.position.x,
-    #                        positionY=static_map.info.origin.position.y, data=static_map.data.tolist())
-    # print(static_map.data.tolist())
-    # print(static_map_json)
-    # print("orientation : ", static_map.info.origin.orientation)
-    # print("data size : ", len(static_map.data))
-    # print("----")
-    # If desired, you can change or load the map as well
-    # navigator.changeMap('/path/to/map.yaml')
-    # You may use the navigator to clear or obtain costmaps
-    # navigator.clearAllCostmaps()  # also have clearLocalCostmap() and clearGlobalCostmap()
-    # global_costmap = navigator.getGlobalCostmap()
-    # local_costmap = navigator.getLocalCostmap()
-    # Go to our demos first goal pose
-    # goal_pose = PoseStamped()
-    # goal_pose.header.frame_id = 'map'
-    # goal_pose.header.stamp = navigator.get_clock().now().to_msg()
-    # goal_pose.pose.position.x = 2.0
-    # goal_pose.pose.position.y = -0.5
-    # goal_pose.pose.orientation.w = 1.0
-    # # sanity check a valid path exists
-    # path = navigator.getPath(initial_pose, goal_pose)
-    # navigator.goToPose(goal_pose)
-    # print('goal pose  ', goal_pose.pose)
-####
-    # websocket.enableTrace(True)
-    # print("h1")
-    # ws = websocket.WebSocketApp(
-    #     "ws://172.16.165.127:30555", on_message=on_message, on_close=on_close, on_open=on_open)
-    # wst = threading.Thread(target=ws.run_forever)
-    # print("h2")
-    # wst.daemon = True
-    # print("h3")
-    # wst.start()
-    # print("h4")
-    # while True:
-    #     time.sleep(10)
-####
-    # i = 0
-    # while not navigator.isTaskComplete():
-    #     ################################################
-    #     #
-    #     # Implement some code here for your application!
-    #     #
-    #     ################################################
-    #     # Do something with the feedback
-    #     i = i + 1
-    #     feedback = navigator.getFeedback()
-    #     if feedback and i % 5 == 0:
-    #         print('Estimated time of arrival: ' + '{0:.0f}'.format(
-    #               Duration.from_msg(feedback.estimated_time_remaining).nanoseconds / 1e9)
-    #               + ' seconds.')
-    #         # Some navigation timeout to demo cancellation
-    #         if Duration.from_msg(feedback.navigation_time) > Duration(seconds=600.0):
-    #             navigator.cancelTask()
-    #         # Some navigation request change to demo preemption
-    #         if Duration.from_msg(feedback.navigation_time) > Duration(seconds=18.0):
-    #             goal_pose.pose.position.x = -3.0
-    #             navigator.goToPose(goal_pose)
-    # # Do something depending on the return code
-    # result = navigator.getResult()
-    # if result == TaskResult.SUCCEEDED:
-    #     print('Goal succeeded!')
-    # elif result == TaskResult.CANCELED:
-    #     print('Goal was canceled!')
-    # elif result == TaskResult.FAILED:
-    #     print('Goal failed!')
-    # else:
-    #     print('Goal has an invalid return status!')
-    # navigator.lifecycleShutdown()
-    # exit(0)
 if __name__ == '__main__':
     main()

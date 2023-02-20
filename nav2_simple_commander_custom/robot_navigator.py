@@ -494,7 +494,6 @@ class BasicNavigator(Node):
     def _amclPoseCallback(self, msg):
         self.debug('Received amcl pose')
         self.initial_pose_received = True
-        print('amcl ', msg)
         return
 
     def _feedbackCallback(self, msg):
