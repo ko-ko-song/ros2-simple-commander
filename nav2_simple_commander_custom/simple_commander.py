@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+import socket
 import numpy as np  # Scientific computing library for Python
 import math
 from rclpy.executors import MultiThreadedExecutor
@@ -34,34 +38,43 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 
 class WebMonitorInterface():
-    def __init__(self, subscriber, commander):
+    def __init__(self, subscriber, simpleCommander):
         self.subscriber = subscriber
-        self.commander = commander
+        self.messageQ = Queue()
+        self.commander = simpleCommander
         self.ws = None
 
     def connect(self, uri):
-        websocket.enableTrace(False)
-        self.ws = websocket.WebSocketApp(
-            uri, on_message=self.on_message, on_close=self.on_close, on_open=self.on_open)
-        wst = threading.Thread(target=self.ws.run_forever)
-        print("ws : connecting " + uri)
-        wst.daemon = True
-        wst.start()
+        # websocket.enableTrace(False)
+        # self.ws = websocket.WebSocketApp(
+        #     uri, on_message=self.on_message, on_close=self.on_close, on_open=self.on_open)
+        # wst = threading.Thread(target=self.ws.run_forever)
+        # print("ws : connecting " + uri)
+        # wst.daemon = True
+        # wst.start()
         self.start()
 
-    def on_open(self, ws):
-        self.ws = ws
-        print("ws: Opened connection")
+        # 스레드 객체를 생성합니다. 인자로 websocket 서버와 통신할 함수를 전달합니다.
+        ws_thread = threading.Thread(target=self.ws_handler, args=(uri,))
 
-    def on_message(self, ws, message):
-        parsed = json.loads(message)
-        # print("ws: received   " + parsed["type"])
-        messageType = parsed["type"]
-        if (messageType == "requestGoToPose"):
-            self.commander.requestGoToPose(parsed['positionX'], parsed['positionY'], parsed['positionZ'], parsed['orientationX'], parsed['orientationY'],
-                                           parsed['orientationZ'], parsed['orientationW'])
-        elif (messageType == "requestStaticMap"):
-            self.commander.requestStaticMap()
+        # 스레드를 시작합니다. start 메소드를 호출하면 스레드에서 실행할 함수가 호출됩니다.
+        ws_thread.start()
+
+    def ws_handler(self, uri):
+        ws = websocket.WebSocket(enable_multithread=True)
+        ws.connect(uri)
+        print("ws : connecting " + uri)
+
+        self.ws = ws
+        while True:
+            message = self.ws.recv()
+            self.messageQ.put(message)
+
+            # self.on_message(self, message)
+
+    # def on_open(self, ws):
+    #     self.ws = ws
+    #     print("ws: Opened connection")
 
     def on_close(self, ws):
         print("ws: close")
@@ -69,6 +82,7 @@ class WebMonitorInterface():
     def send_message(self, type, json_message):
         # print("send message   type : " + type)
         if (self.ws != None):
+            # print("send message   type : " + type)
             self.ws.send(json_message)
 
     def start(self):
@@ -106,7 +120,6 @@ class SubscriberForWeb(Node):
         return
 
     def _laserScanCallback(self, message):
-
         ranges = []
         if (self.interface != None):
             range_max = message.range_max
@@ -180,6 +193,9 @@ class SimpleCommander(BasicNavigator):
         self.get_staticmap_srv = self.create_client(
             GetMap, '/map_server/map')
         self.interface = None
+
+    def addMessageQ(self, message):
+        self.messageQ.append(message)
 
     def set_interface(self, interface):
         self.interface = interface
@@ -262,6 +278,9 @@ class SimpleCommander(BasicNavigator):
                                           positionY=static_map.info.origin.position.y, data=static_map.data.tolist()))
         self.interface.send_message("static_map", static_map_json)
 
+    def requestCancelTask(self):
+        self.cancelTask()
+
     def getStaticMap(self):
         """Get the static map."""
         while not self.get_staticmap_srv.wait_for_service(timeout_sec=2.0):
@@ -273,28 +292,60 @@ class SimpleCommander(BasicNavigator):
 
 
 def main():
+
     rclpy.init()
     try:
+
+        # if (messageQ.empty)
+
         subscriber = SubscriberForWeb()
         simpleCommander = SimpleCommander()
         simpleCommander.waitUntilNav2Active()
-        executor = MultiThreadedExecutor(num_threads=3)
+        executor = MultiThreadedExecutor(num_threads=2)
         executor.add_node(simpleCommander)
         executor.add_node(subscriber)
 
         web_monitor_interface = WebMonitorInterface(
             subscriber, simpleCommander)
-        web_monitor_interface.connect("ws://192.168.1.22:36888")
+        web_monitor_interface.connect("ws://172.16.165.208:36888")
         try:
-            executor.spin()
+            # subscriber_thread = threading.Thread(
+            #     target=rclpy.spin, args=(subscriber,))
+            # subscriber_thread.start()
+            executor_thread = threading.Thread(
+                target=executor.spin)
+            executor_thread.start()
+
+            commanderThreadPool = ThreadPoolExecutor(max_workers=4)
+            while True:
+                if not (web_monitor_interface.messageQ.qsize() == 0):
+                    message = web_monitor_interface.messageQ.get()
+                    commanderThreadPool.submit(
+                        on_message, simpleCommander, message)
+
         except KeyboardInterrupt:
             simpleCommander.get_logger().info('Keyboard Interrupt (SIGINT)')
         finally:
-            executor.shutdown()
+            # commanderThreadPool.shutdown()
             simpleCommander.destroy_node()
             subscriber.destroy_node()
+            # executor.shutdown()
     finally:
         rclpy.shutdown()
+
+
+def on_message(commander, message):
+    parsed = json.loads(message)
+    # print("ws: received   " + parsed["type"])
+    messageType = parsed["type"]
+    if (messageType == "requestGoToPose"):
+        commander.requestGoToPose(parsed['positionX'], parsed['positionY'], parsed['positionZ'], parsed['orientationX'], parsed['orientationY'],
+                                  parsed['orientationZ'], parsed['orientationW'])
+    elif (messageType == "requestStaticMap"):
+        commander.requestStaticMap()
+
+    elif (messageType == "requestCancelTask"):
+        commander.requestCancelTask()
 
 
 if __name__ == '__main__':
